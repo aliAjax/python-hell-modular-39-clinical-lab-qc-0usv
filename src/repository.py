@@ -2,7 +2,7 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 
-from .domain import ConflictError, NotFoundError
+from .domain import ConflictError, NotFoundError, ValidationError
 
 
 def utcnow():
@@ -139,6 +139,168 @@ class SQLiteRepository:
         finally:
             connection.close()
         return self.get_entity(entity_id)
+
+    def correct_qc_run(self, old_run_id, new_run_id, new_data, expected_version, actor, reason, idempotency_key):
+        """Atomically supersede a QC run with a corrected version.
+
+        The old run is voided and linked to the new version. Every result batch
+        that referenced the old run is repointed to the new version; batches that
+        had already been released under the old version are rolled back to
+        ``waiting`` (with a ``release_rollbacks`` trail) so they are re-processed
+        against the corrected QC result. All writes share one transaction, so a
+        failed correction leaves no partial records to clean up on retry.
+        """
+        now = utcnow()
+        connection = self._connect()
+        affected = []
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM entities WHERE id = ?", (old_run_id,)
+            ).fetchone()
+            if not row:
+                raise NotFoundError("entity not found: " + old_run_id)
+            old = self._entity_from_row(row)
+            if old["kind"] != "qc_run":
+                raise ValidationError("correct is only supported for qc_run")
+            current_version = int(old["version"])
+            if expected_version is not None and current_version != int(expected_version):
+                raise ConflictError(
+                    "version conflict: expected %s, found %s"
+                    % (expected_version, current_version)
+                )
+
+            # New version: a fresh qc_run at version 1, pending re-evaluation.
+            connection.execute(
+                "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+                "VALUES (?, 'qc_run', 'pending', 1, ?, ?, ?, ?)",
+                (new_run_id, json.dumps(new_data, ensure_ascii=False, sort_keys=True),
+                 actor.user_id, now, now),
+            )
+
+            # Void the old version and link it to the new one.
+            old_data = dict(old["data"])
+            old_data["superseded_by_run_id"] = new_run_id
+            old_history = list(old_data.get("correction_history") or [])
+            old_history.append({
+                "actor_id": actor.user_id,
+                "reason": reason,
+                "from_status": old["status"],
+                "superseded_by_run_id": new_run_id,
+                "at": now,
+            })
+            old_data["correction_history"] = old_history
+            cursor = connection.execute(
+                "UPDATE entities SET status = 'voided', version = version + 1, data = ?, updated_at = ? "
+                "WHERE id = ? AND version = ?",
+                (json.dumps(old_data, ensure_ascii=False, sort_keys=True), now,
+                 old_run_id, current_version),
+            )
+            if cursor.rowcount != 1:
+                raise ConflictError("version conflict while voiding qc run: " + old_run_id)
+
+            # Repoint every batch that referenced the old run.
+            batch_rows = connection.execute(
+                "SELECT * FROM entities WHERE kind = 'result_batch'"
+            ).fetchall()
+            for brow in batch_rows:
+                batch = self._entity_from_row(brow)
+                if batch["data"].get("qc_run_id") != old_run_id:
+                    continue
+                was_released = batch["status"] == "released"
+                bdata = dict(batch["data"])
+                bdata["qc_run_id"] = new_run_id
+                rollback = None
+                if was_released:
+                    rollback = {
+                        "actor_id": actor.user_id,
+                        "reason": reason,
+                        "from_status": "released",
+                        "to_status": "waiting",
+                        "old_run_id": old_run_id,
+                        "new_run_id": new_run_id,
+                        "at": now,
+                    }
+                    bdata["release_rollbacks"] = list(bdata.get("release_rollbacks") or []) + [rollback]
+                new_status = "waiting" if was_released else batch["status"]
+                connection.execute(
+                    "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+                    "WHERE id = ?",
+                    (new_status, json.dumps(bdata, ensure_ascii=False, sort_keys=True),
+                     now, batch["id"]),
+                )
+                affected.append({
+                    "batch_id": batch["id"],
+                    "was_released": was_released,
+                    "from_status": batch["status"],
+                    "to_status": new_status,
+                })
+                connection.execute(
+                    "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        batch["id"],
+                        actor.user_id,
+                        actor.role,
+                        "correct",
+                        batch["status"],
+                        new_status,
+                        json.dumps(
+                            {
+                                "reason": reason,
+                                "old_run_id": old_run_id,
+                                "new_run_id": new_run_id,
+                                "released_rolled_back": was_released,
+                            },
+                            ensure_ascii=False, sort_keys=True,
+                        ),
+                        now,
+                    ),
+                )
+
+            # Audit trail for both versions.
+            connection.execute(
+                "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    old_run_id, actor.user_id, actor.role, "correct",
+                    old["status"], "voided",
+                    json.dumps({"reason": reason, "new_run_id": new_run_id,
+                                "value": new_data.get("value")},
+                               ensure_ascii=False, sort_keys=True),
+                    now,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    new_run_id, actor.user_id, actor.role, "version_created",
+                    None, "pending",
+                    json.dumps({"reason": reason, "supersedes_run_id": old_run_id,
+                                "value": new_data.get("value")},
+                               ensure_ascii=False, sort_keys=True),
+                    now,
+                ),
+            )
+
+            if idempotency_key:
+                connection.execute(
+                    "INSERT OR REPLACE INTO idempotency(actor_id, idem_key, entity_id, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (actor.user_id, idempotency_key, new_run_id, now),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return {
+            "old_run": self.get_entity(old_run_id),
+            "new_run": self.get_entity(new_run_id),
+            "affected": affected,
+        }
 
     def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
         with self._connect() as connection:

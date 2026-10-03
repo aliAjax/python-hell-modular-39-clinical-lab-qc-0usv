@@ -194,6 +194,17 @@ def _validate_correct(actor, entity, data, lookup):
     return {"correction_history": history}
 
 
+def _validate_qc_run_correct(actor, entity, data, lookup):
+    """Correcting a QC run also requires a new numeric value (the corrected result)."""
+    result = _validate_correct(actor, entity, data, lookup)
+    try:
+        value = float(data.get("value"))
+    except (TypeError, ValueError):
+        raise ValidationError("qc result value must be numeric")
+    result["value"] = value
+    return result
+
+
 class RuleEngine:
     ALIASES = {
         "assays": "assay",
@@ -305,7 +316,7 @@ class RuleEngine:
         ("result_batch", "release"): _validate_release,
         ("result_batch", "retest"): _validate_qc_retest,
         ("qc_lot", "switch_in"): _validate_switch_lot,
-        ("qc_run", "correct"): _validate_correct,
+        ("qc_run", "correct"): _validate_qc_run_correct,
         ("result_batch", "correct"): _validate_correct,
     }
 
