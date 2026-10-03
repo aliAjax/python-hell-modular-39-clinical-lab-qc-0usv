@@ -98,45 +98,43 @@ def create_handler(service, rules, static_dir):
             except Exception as exc:
                 self._fail(exc)
 
+        def _transition(self, actor, entity_id, body):
+            action = body.pop("action", None)
+            if not action:
+                raise ValidationError("action is required")
+            return service.transition(
+                actor=actor,
+                entity_id=entity_id,
+                action=action,
+                data=body.pop("data", body),
+                expected_version=body.pop("expected_version", None),
+                expected_revision=body.pop("expected_revision", None),
+                idempotency_key=self.headers.get("Idempotency-Key"),
+            )
+
         def do_POST(self):
             try:
                 parsed = urlparse(self.path)
                 parts = [part for part in parsed.path.split("/") if part]
                 actor = self._actor()
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
-                    body = self._body()
-                    action = body.pop("action", None)
-                    if not action:
-                        raise ValidationError("action is required")
-                    return self._send(
-                        200,
-                        service.transition(
-                            actor,
-                            parts[2],
-                            action,
-                            body.pop("data", body),
-                            body.pop("expected_version", None),
-                        ),
-                    )
+                    return self._send(200, self._transition(actor, parts[2], self._body()))
                 if len(parts) == 4 and parts[0] == "api" and parts[3] == "actions":
+                    return self._send(200, self._transition(actor, parts[2], self._body()))
+                if len(parts) == 5 and parts[0] == "api" and parts[4] == "actions":
                     body = self._body()
-                    action = body.pop("action", None)
-                    if not action:
-                        raise ValidationError("action is required")
+                    action = body.pop("action", parts[3])
                     return self._send(
                         200,
                         service.transition(
                             actor,
                             parts[2],
                             action,
-                            body.pop("data", body),
+                            body,
                             body.pop("expected_version", None),
+                            body.pop("expected_revision", None),
+                            self.headers.get("Idempotency-Key"),
                         ),
-                    )
-                if len(parts) == 5 and parts[0] == "api" and parts[4] == "actions":
-                    return self._send(
-                        200,
-                        service.transition(actor, parts[2], parts[3], self._body(), None),
                     )
                 if len(parts) == 2 and parts[0] == "api":
                     body = self._body()

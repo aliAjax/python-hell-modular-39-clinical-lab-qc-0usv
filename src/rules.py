@@ -117,8 +117,12 @@ def _validate_result_batch(actor, data, lookup):
         raise ValidationError("assay does not exist")
     if not _find_one(lookup, "instrument", "id", data.get("instrument_id")):
         raise ValidationError("instrument does not exist")
-    if not _find_one(lookup, "qc_run", "id", data.get("qc_run_id")):
+    run = _find_one(lookup, "qc_run", "id", data.get("qc_run_id"))
+    if not run:
         raise ValidationError("qc run does not exist")
+    if run["status"] == "superseded":
+        raise ConflictError("qc run %s is superseded; use current version %s"
+                            % (run["id"], run["data"].get("superseded_by", "")))
     if int(data.get("patient_count", 0)) < 0:
         raise ValidationError("patient_count cannot be negative")
     return {}
@@ -153,7 +157,12 @@ def _validate_evaluate(actor, entity, data, lookup):
 def _validate_release(actor, entity, data, lookup):
     run = _find_one(lookup, "qc_run", "id", entity["data"].get("qc_run_id"))
     instrument = _find_one(lookup, "instrument", "id", entity["data"].get("instrument_id"))
-    if not run or run["status"] != "accepted":
+    if not run:
+        raise ConflictError("result batch can only be released with an accepted QC run")
+    if run["status"] == "superseded":
+        raise ConflictError("qc run %s was superseded by %s; release against the current version"
+                            % (run["id"], run["data"].get("superseded_by", "")))
+    if run["status"] != "accepted":
         raise ConflictError("result batch can only be released with an accepted QC run")
     if not instrument or instrument["status"] != "ready":
         raise ConflictError("instrument is not ready")
@@ -194,6 +203,21 @@ def _validate_correct(actor, entity, data, lookup):
     return {"correction_history": history}
 
 
+def _validate_qc_correct(actor, entity, data, lookup):
+    if not data.get("reason"):
+        raise ValidationError("correction reason is required")
+    try:
+        value = float(data.get("value"))
+    except (TypeError, ValueError):
+        raise ValidationError("qc result value must be numeric")
+    if entity["status"] == "superseded":
+        raise ConflictError(
+            "qc run %s is superseded; correct the current version %s instead"
+            % (entity["id"], entity["data"].get("superseded_by", ""))
+        )
+    return {"value": value}
+
+
 class RuleEngine:
     ALIASES = {
         "assays": "assay",
@@ -231,7 +255,7 @@ class RuleEngine:
             "retest": (("rejected",), "retesting"),
             "investigate": (("rejected",), "investigated"),
             "resolve": (("investigated", "retesting"), "resolved"),
-            "correct": (("accepted", "rejected", "investigated", "resolved"), "pending"),
+            "correct": (("accepted", "rejected", "investigated", "resolved"), "superseded"),
         },
         "result_batch": {
             "release": (("waiting",), "released"),
@@ -305,7 +329,7 @@ class RuleEngine:
         ("result_batch", "release"): _validate_release,
         ("result_batch", "retest"): _validate_qc_retest,
         ("qc_lot", "switch_in"): _validate_switch_lot,
-        ("qc_run", "correct"): _validate_correct,
+        ("qc_run", "correct"): _validate_qc_correct,
         ("result_batch", "correct"): _validate_correct,
     }
 
@@ -339,7 +363,12 @@ class RuleEngine:
         custom = self.CUSTOM_CREATE.get(kind)
         return custom(actor, data, lookup) if custom else {}
 
-    def validate_transition(self, actor, entity, action, data, lookup=None):
+    def check_transition(self, actor, entity, action, data, lookup=None):
+        """Validate role/status/required fields and run the custom validator.
+
+        Returns ``(next_status, patch)`` without persisting anything, so callers
+        can run it inside their own transaction.
+        """
         kind = self.normalize_kind(entity["kind"])
         transition = self.TRANSITIONS.get(kind, {}).get(action)
         if not transition:
@@ -358,3 +387,6 @@ class RuleEngine:
         if extra:
             patch.update(extra)
         return next_status, patch
+
+    def validate_transition(self, actor, entity, action, data, lookup=None):
+        return self.check_transition(actor, entity, action, data, lookup)
